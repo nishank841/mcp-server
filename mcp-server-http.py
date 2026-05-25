@@ -14,6 +14,9 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+import requests
+from requests.auth import HTTPBasicAuth
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
@@ -271,6 +274,147 @@ def provision_app_infrastructure(app_name: str, language: str) -> str:
         return f"ERROR: {str(e)}"
 
 
+# ── Jira helpers ──────────────────────────────────────────────────────────────
+
+def _jira_auth():
+    return HTTPBasicAuth(
+        os.environ.get("JIRA_EMAIL", ""),
+        os.environ.get("JIRA_API_TOKEN", ""),
+    )
+
+def _jira_url(path: str) -> str:
+    base = os.environ.get("JIRA_URL", "").rstrip("/")
+    return f"{base}/rest/api/3/{path.lstrip('/')}"
+
+def _jira_headers():
+    return {"Accept": "application/json", "Content-Type": "application/json"}
+
+
+def jira_get_issue(issue_key: str) -> str:
+    r = requests.get(_jira_url(f"issue/{issue_key}"), auth=_jira_auth(), headers=_jira_headers())
+    if not r.ok:
+        return f"ERROR: {r.status_code} {r.text}"
+    d = r.json()
+    f = d["fields"]
+    assignee = (f.get("assignee") or {}).get("displayName", "Unassigned")
+    return (
+        f"Key: {d['key']}\n"
+        f"Summary: {f.get('summary')}\n"
+        f"Type: {f['issuetype']['name']}\n"
+        f"Status: {f['status']['name']}\n"
+        f"Assignee: {assignee}\n"
+        f"Priority: {(f.get('priority') or {}).get('name', 'None')}\n"
+        f"Reporter: {(f.get('reporter') or {}).get('displayName', 'Unknown')}\n"
+        f"Description: {str(f.get('description') or '')[:300]}"
+    )
+
+
+def jira_create_ticket(project_key: str, summary: str, issue_type: str,
+                        description: str, epic_key: str, assignee_email: str) -> str:
+    payload: Dict[str, Any] = {
+        "fields": {
+            "project": {"key": project_key},
+            "summary": summary,
+            "issuetype": {"name": issue_type},
+            "description": {
+                "type": "doc", "version": 1,
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": description}]}],
+            },
+        }
+    }
+    if assignee_email:
+        # look up accountId by email first
+        search = requests.get(
+            _jira_url(f"user/search?query={assignee_email}"),
+            auth=_jira_auth(), headers=_jira_headers(),
+        )
+        if search.ok and search.json():
+            payload["fields"]["assignee"] = {"accountId": search.json()[0]["accountId"]}
+
+    if epic_key:
+        # try parent (next-gen) first; fall back to Epic Link (classic)
+        payload["fields"]["parent"] = {"key": epic_key}
+
+    r = requests.post(_jira_url("issue"), auth=_jira_auth(),
+                      headers=_jira_headers(), json=payload)
+    if not r.ok:
+        # retry without parent for classic projects using Epic Link field
+        if epic_key and "parent" in payload["fields"]:
+            del payload["fields"]["parent"]
+            payload["fields"]["customfield_10014"] = epic_key
+            r = requests.post(_jira_url("issue"), auth=_jira_auth(),
+                              headers=_jira_headers(), json=payload)
+    if not r.ok:
+        return f"ERROR: {r.status_code} {r.text}"
+    key = r.json()["key"]
+    base = os.environ.get("JIRA_URL", "").rstrip("/")
+    return f"SUCCESS: Created {issue_type} {key}\nURL: {base}/browse/{key}"
+
+
+def jira_create_epic(project_key: str, summary: str, description: str) -> str:
+    payload = {
+        "fields": {
+            "project": {"key": project_key},
+            "summary": summary,
+            "issuetype": {"name": "Epic"},
+            "description": {
+                "type": "doc", "version": 1,
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": description}]}],
+            },
+        }
+    }
+    r = requests.post(_jira_url("issue"), auth=_jira_auth(),
+                      headers=_jira_headers(), json=payload)
+    if not r.ok:
+        return f"ERROR: {r.status_code} {r.text}"
+    key = r.json()["key"]
+    base = os.environ.get("JIRA_URL", "").rstrip("/")
+    return f"SUCCESS: Created Epic {key}\nURL: {base}/browse/{key}"
+
+
+def jira_change_assignee(issue_key: str, assignee_email: str) -> str:
+    search = requests.get(
+        _jira_url(f"user/search?query={assignee_email}"),
+        auth=_jira_auth(), headers=_jira_headers(),
+    )
+    if not search.ok or not search.json():
+        return f"ERROR: Could not find user with email '{assignee_email}'"
+    account_id = search.json()[0]["accountId"]
+    r = requests.put(
+        _jira_url(f"issue/{issue_key}/assignee"),
+        auth=_jira_auth(), headers=_jira_headers(),
+        json={"accountId": account_id},
+    )
+    if r.status_code == 204:
+        return f"SUCCESS: {issue_key} assigned to {assignee_email}"
+    return f"ERROR: {r.status_code} {r.text}"
+
+
+def jira_close_issue(issue_key: str) -> str:
+    # get available transitions
+    r = requests.get(_jira_url(f"issue/{issue_key}/transitions"),
+                     auth=_jira_auth(), headers=_jira_headers())
+    if not r.ok:
+        return f"ERROR fetching transitions: {r.status_code} {r.text}"
+    transitions = r.json().get("transitions", [])
+    done_id = None
+    for t in transitions:
+        if t["name"].lower() in ("done", "closed", "resolved", "close", "complete"):
+            done_id = t["id"]
+            break
+    if not done_id:
+        names = [t["name"] for t in transitions]
+        return f"ERROR: No 'Done/Closed' transition found. Available: {names}"
+    r2 = requests.post(
+        _jira_url(f"issue/{issue_key}/transitions"),
+        auth=_jira_auth(), headers=_jira_headers(),
+        json={"transition": {"id": done_id}},
+    )
+    if r2.status_code == 204:
+        return f"SUCCESS: {issue_key} closed/done"
+    return f"ERROR: {r2.status_code} {r2.text}"
+
+
 # ── MCP tool schema ────────────────────────────────────────────────────────────
 
 TOOLS = [
@@ -336,6 +480,65 @@ TOOLS = [
             "required": ["name", "namespace"],
         },
     },
+    {
+        "name": "jira_get_issue",
+        "description": "Get details of a Jira issue by key (e.g. PROJ-123)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"issue_key": {"type": "string", "description": "Jira issue key e.g. PROJ-123"}},
+            "required": ["issue_key"],
+        },
+    },
+    {
+        "name": "jira_create_ticket",
+        "description": "Create a Jira ticket (Story, Task, Bug) optionally linked to an epic",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_key":     {"type": "string", "description": "Jira project key e.g. PROJ"},
+                "summary":         {"type": "string", "description": "Ticket title/summary"},
+                "issue_type":      {"type": "string", "description": "Story, Task, or Bug"},
+                "description":     {"type": "string", "description": "Ticket description"},
+                "epic_key":        {"type": "string", "description": "Epic key to link under (optional)"},
+                "assignee_email":  {"type": "string", "description": "Email of assignee (optional)"},
+            },
+            "required": ["project_key", "summary", "issue_type", "description"],
+        },
+    },
+    {
+        "name": "jira_create_epic",
+        "description": "Create a new Jira Epic in a project",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_key":  {"type": "string", "description": "Jira project key e.g. PROJ"},
+                "summary":      {"type": "string", "description": "Epic title"},
+                "description":  {"type": "string", "description": "Epic description"},
+            },
+            "required": ["project_key", "summary", "description"],
+        },
+    },
+    {
+        "name": "jira_change_assignee",
+        "description": "Change the assignee of a Jira issue",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "issue_key":       {"type": "string", "description": "Jira issue key e.g. PROJ-123"},
+                "assignee_email":  {"type": "string", "description": "Email of the new assignee"},
+            },
+            "required": ["issue_key", "assignee_email"],
+        },
+    },
+    {
+        "name": "jira_close_issue",
+        "description": "Close or mark a Jira issue as Done",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"issue_key": {"type": "string", "description": "Jira issue key e.g. PROJ-123"}},
+            "required": ["issue_key"],
+        },
+    },
 ]
 
 TOOL_DISPATCH = {
@@ -347,6 +550,13 @@ TOOL_DISPATCH = {
     "get_load_balancer_url": lambda a: get_load_balancer_url(a["service_name"], a["namespace"]),
     "apply_manifest":        lambda a: apply_manifest(a["yaml_content"]),
     "get_deployment_status": lambda a: get_deployment_status(a["name"], a["namespace"]),
+    "jira_get_issue":        lambda a: jira_get_issue(a["issue_key"]),
+    "jira_create_ticket":    lambda a: jira_create_ticket(
+                                a["project_key"], a["summary"], a["issue_type"],
+                                a.get("description", ""), a.get("epic_key", ""), a.get("assignee_email", "")),
+    "jira_create_epic":      lambda a: jira_create_epic(a["project_key"], a["summary"], a.get("description", "")),
+    "jira_change_assignee":  lambda a: jira_change_assignee(a["issue_key"], a["assignee_email"]),
+    "jira_close_issue":      lambda a: jira_close_issue(a["issue_key"]),
 }
 
 
