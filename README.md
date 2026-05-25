@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server that runs as a Kubernetes pod and exposes cluster management tools over HTTP/SSE.
 
-## Tools exposed
+## Tools exposed are
 
 | Tool | Description |
 |------|-------------|
