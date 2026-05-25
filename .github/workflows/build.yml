@@ -40,7 +40,7 @@ jobs:
         env:
           KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
         run: |
-          echo "$KUBECONFIG_DATA" | base64 -d > /tmp/kubeconfig
+          echo "$KUBECONFIG_DATA" > /tmp/kubeconfig
           export KUBECONFIG=/tmp/kubeconfig
           kubectl rollout restart deployment/mcp-server -n mcp-server
           kubectl rollout status deployment/mcp-server -n mcp-server --timeout=120s
