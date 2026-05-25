@@ -2,7 +2,19 @@
 
 MCP (Model Context Protocol) server that runs as a Kubernetes pod and exposes cluster management tools over HTTP/SSE.
 
-## Tools exposed as
+## Repository structure
+
+This repo contains **only the application code and Docker build**. All Kubernetes resources (namespace, serviceaccount, RBAC, service) live in the [kube-helm](https://github.com/nishank841/kube-helm) repo.
+
+```
+mcp-server/
+├── mcp-server-http.py        # FastAPI HTTP/SSE MCP server
+├── Dockerfile                # Python + kubectl + helm + deps
+└── .github/workflows/
+    └── build.yml             # Build → push → rollout restart on every push to main
+```
+
+## Tools exposed
 
 | Tool | Description |
 |------|-------------|
@@ -15,29 +27,31 @@ MCP (Model Context Protocol) server that runs as a Kubernetes pod and exposes cl
 | `apply_manifest` | Apply a YAML manifest to the cluster |
 | `get_deployment_status` | Get deployment rollout status |
 
-## Build & push Docker image
+## CI/CD pipeline
 
-```bash
-docker build -t nishank841/kube-helm-mcp:latest .
-docker push nishank841/kube-helm-mcp:latest
-```
+Every push to `main` triggers GitHub Actions to:
+1. Build the Docker image
+2. Push `nishank840/kube-helm-mcp:latest` to Docker Hub
+3. Run `kubectl rollout restart deployment/mcp-server-app -n mcp-server` on the cluster
 
-## Deploy to Kubernetes
+### Required GitHub secrets
 
-```bash
-# 1. Create the GitHub token secret
-kubectl create secret generic mcp-github-token \
-  --from-literal=GITHUB_TOKEN=ghp_yourtoken \
-  -n mcp-server
+| Secret | Value |
+|--------|-------|
+| `DOCKERHUB_USERNAME` | `nishank840` |
+| `DOCKERHUB_TOKEN` | Docker Hub access token (Read, Write, Delete) |
+| `KUBECONFIG` | Raw content of `~/.kube/config` from master node |
 
-# 2. Apply all manifests
-kubectl apply -f manifests/
+## Kubernetes resources (in kube-helm repo)
 
-# 3. Verify pod is running
-kubectl get pods -n mcp-server
-```
+| File | Resource |
+|------|----------|
+| `manifests/namespaces/mcp-server.yaml` | Namespace |
+| `manifests/serviceaccounts/mcp-server.yaml` | ServiceAccount + ClusterRole + ClusterRoleBinding |
+| `manifests/services/mcp-server-service.yaml` | NodePort 30082 |
+| `app-values/mcp-server/values.yaml` | Helm deployment (image, SA, GITHUB_TOKEN secret) |
 
-## Connect Claude Code
+## Connect Claude Code (local)
 
 Add to `~/.claude.json` under `mcpServers`:
 
@@ -53,9 +67,3 @@ Add to `~/.claude.json` under `mcpServers`:
 ```
 
 Get a node IP: `kubectl get nodes -o wide`
-
-## Health check
-
-```
-GET http://<node-ip>:30082/health
-```
